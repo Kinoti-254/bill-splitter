@@ -1,17 +1,17 @@
 import os
+import csv
+import io
+import psycopg2
+import psycopg2.extras
 from flask import Flask, render_template, request, redirect, flash, jsonify, Response
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
-import sqlite3
-import csv
-import io
 
-# Load .env file if it exists (for local development)
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass  # dotenv not installed — rely on real environment variables
+    pass
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-only-do-not-use-in-production")
@@ -21,41 +21,14 @@ login_manager.init_app(app)
 login_manager.login_view = "login"
 login_manager.login_message = "Please log in to access your bills."
 
-DBN = "db.sqlite"
-
 # ── DB ────────────────────────────────────────────────────────────────────────
 
 def get_db():
-    return sqlite3.connect(DBN)
-
-def init_db():
-    with get_db() as conn:
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS users (
-                id       INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT    NOT NULL UNIQUE,
-                password TEXT    NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS bills (
-                id       INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id  INTEGER NOT NULL,
-                name     TEXT    NOT NULL,
-                currency TEXT    NOT NULL DEFAULT 'KSH',
-                created  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users(id)
-            );
-
-            CREATE TABLE IF NOT EXISTS payments (
-                id      INTEGER PRIMARY KEY AUTOINCREMENT,
-                bill_id INTEGER NOT NULL,
-                name    TEXT    NOT NULL,
-                amount  REAL    NOT NULL,
-                FOREIGN KEY (bill_id) REFERENCES bills(id)
-            );
-        """)
-
-init_db()
+    conn = psycopg2.connect(
+        os.environ.get("DATABASE_URL"),
+        cursor_factory=psycopg2.extras.RealDictCursor
+    )
+    return conn
 
 # ── Auth helpers ───────────────────────────────────────────────────────────────
 
@@ -67,9 +40,11 @@ class User(UserMixin):
 @login_manager.user_loader
 def load_user(user_id):
     with get_db() as conn:
-        row = conn.execute("SELECT id, username FROM users WHERE id=?", (user_id,)).fetchone()
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, username FROM users WHERE id=%s", (user_id,))
+            row = cur.fetchone()
     if row:
-        return User(row[0], row[1])
+        return User(row["id"], row["username"])
     return None
 
 # ── Bill splitting logic ───────────────────────────────────────────────────────
@@ -107,10 +82,14 @@ def register():
         hashed = generate_password_hash(password)
         try:
             with get_db() as conn:
-                conn.execute("INSERT INTO users (username, password) VALUES (?,?)", (username, hashed))
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO users (username, password) VALUES (%s, %s)",
+                        (username, hashed)
+                    )
             flash("Account created! Please log in.")
             return redirect("/login")
-        except sqlite3.IntegrityError:
+        except psycopg2.errors.UniqueViolation:
             flash("Username already taken.")
             return redirect("/register")
     return render_template("register.html")
@@ -121,9 +100,14 @@ def login():
         username = request.form["username"].strip()
         password = request.form["password"]
         with get_db() as conn:
-            row = conn.execute("SELECT id, username, password FROM users WHERE username=?", (username,)).fetchone()
-        if row and check_password_hash(row[2], password):
-            login_user(User(row[0], row[1]))
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, username, password FROM users WHERE username=%s",
+                    (username,)
+                )
+                row = cur.fetchone()
+        if row and check_password_hash(row["password"], password):
+            login_user(User(row["id"], row["username"]))
             return redirect("/")
         flash("Invalid username or password.")
     return render_template("login.html")
@@ -140,10 +124,12 @@ def logout():
 @login_required
 def index():
     with get_db() as conn:
-        bills = conn.execute(
-            "SELECT id, name, currency, created FROM bills WHERE user_id=? ORDER BY created DESC",
-            (current_user.id,)
-        ).fetchall()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, name, currency, created FROM bills WHERE user_id=%s ORDER BY created DESC",
+                (current_user.id,)
+            )
+            bills = cur.fetchall()
     return render_template("index.html", bills=bills)
 
 @app.route("/bill/new", methods=["GET", "POST"])
@@ -156,11 +142,12 @@ def new_bill():
             flash("Bill name is required.")
             return redirect("/bill/new")
         with get_db() as conn:
-            cur = conn.execute(
-                "INSERT INTO bills (user_id, name, currency) VALUES (?,?,?)",
-                (current_user.id, name, currency)
-            )
-            bill_id = cur.lastrowid
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO bills (user_id, name, currency) VALUES (%s, %s, %s) RETURNING id",
+                    (current_user.id, name, currency)
+                )
+                bill_id = cur.fetchone()["id"]
         return redirect(f"/bill/{bill_id}")
     return render_template("new_bill.html")
 
@@ -168,19 +155,24 @@ def new_bill():
 @login_required
 def bill(bill_id):
     with get_db() as conn:
-        b = conn.execute("SELECT id, name, currency FROM bills WHERE id=? AND user_id=?",
-                         (bill_id, current_user.id)).fetchone()
-        if not b:
-            flash("Bill not found.")
-            return redirect("/")
-        payments = conn.execute(
-            "SELECT id, name, amount FROM payments WHERE bill_id=?", (bill_id,)
-        ).fetchall()
-    payments_list = [{"id": r[0], "name": r[1], "amount": r[2]} for r in payments]
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, name, currency FROM bills WHERE id=%s AND user_id=%s",
+                (bill_id, current_user.id)
+            )
+            b = cur.fetchone()
+            if not b:
+                flash("Bill not found.")
+                return redirect("/")
+            cur.execute(
+                "SELECT id, name, amount FROM payments WHERE bill_id=%s", (bill_id,)
+            )
+            payments = cur.fetchall()
+    payments_list = [{"id": p["id"], "name": p["name"], "amount": p["amount"]} for p in payments]
     total, share, transactions = calculate(payments_list)
-    tx_strings = [f"{t['from']} pays {t['to']} {b[2]} {t['amount']:.2f}" for t in transactions]
+    tx_strings = [f"{t['from']} pays {t['to']} {b['currency']} {t['amount']:.2f}" for t in transactions]
     return render_template("bill.html",
-        bill={"id": b[0], "name": b[1], "currency": b[2]},
+        bill={"id": b["id"], "name": b["name"], "currency": b["currency"]},
         payments=payments_list,
         total=total, share=share,
         transactions=tx_strings
@@ -190,8 +182,12 @@ def bill(bill_id):
 @login_required
 def add_payment(bill_id):
     with get_db() as conn:
-        b = conn.execute("SELECT id FROM bills WHERE id=? AND user_id=?",
-                         (bill_id, current_user.id)).fetchone()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM bills WHERE id=%s AND user_id=%s",
+                (bill_id, current_user.id)
+            )
+            b = cur.fetchone()
     if not b:
         flash("Bill not found.")
         return redirect("/")
@@ -208,8 +204,11 @@ def add_payment(bill_id):
         flash("Amount must be a positive number.")
         return redirect(f"/bill/{bill_id}")
     with get_db() as conn:
-        conn.execute("INSERT INTO payments (bill_id, name, amount) VALUES (?,?,?)",
-                     (bill_id, name, amount))
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO payments (bill_id, name, amount) VALUES (%s, %s, %s)",
+                (bill_id, name, amount)
+            )
     flash(f"Payment for {name} added.")
     return redirect(f"/bill/{bill_id}")
 
@@ -217,16 +216,23 @@ def add_payment(bill_id):
 @login_required
 def edit_payment(bill_id, payment_id):
     with get_db() as conn:
-        b = conn.execute("SELECT id, currency FROM bills WHERE id=? AND user_id=?",
-                         (bill_id, current_user.id)).fetchone()
-        if not b:
-            flash("Bill not found.")
-            return redirect("/")
-        payment = conn.execute("SELECT id, name, amount FROM payments WHERE id=? AND bill_id=?",
-                               (payment_id, bill_id)).fetchone()
-        if not payment:
-            flash("Payment not found.")
-            return redirect(f"/bill/{bill_id}")
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, currency FROM bills WHERE id=%s AND user_id=%s",
+                (bill_id, current_user.id)
+            )
+            b = cur.fetchone()
+            if not b:
+                flash("Bill not found.")
+                return redirect("/")
+            cur.execute(
+                "SELECT id, name, amount FROM payments WHERE id=%s AND bill_id=%s",
+                (payment_id, bill_id)
+            )
+            payment = cur.fetchone()
+            if not payment:
+                flash("Payment not found.")
+                return redirect(f"/bill/{bill_id}")
     if request.method == "POST":
         name   = request.form["name"].strip()
         amount = request.form["amount"]
@@ -241,26 +247,37 @@ def edit_payment(bill_id, payment_id):
             flash("Amount must be a positive number.")
             return redirect(f"/bill/{bill_id}/edit/{payment_id}")
         with get_db() as conn:
-            conn.execute("UPDATE payments SET name=?, amount=? WHERE id=?",
-                         (name, amount, payment_id))
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE payments SET name=%s, amount=%s WHERE id=%s",
+                    (name, amount, payment_id)
+                )
         flash("Payment updated.")
         return redirect(f"/bill/{bill_id}")
     return render_template("edit_payment.html",
-        bill={"id": bill_id, "currency": b[1]},
-        payment={"id": payment[0], "name": payment[1], "amount": payment[2]}
+        bill={"id": bill_id, "currency": b["currency"]},
+        payment={"id": payment["id"], "name": payment["name"], "amount": payment["amount"]}
     )
 
 @app.route("/bill/<int:bill_id>/delete/<int:payment_id>", methods=["POST"])
 @login_required
 def delete_payment(bill_id, payment_id):
     with get_db() as conn:
-        b = conn.execute("SELECT id FROM bills WHERE id=? AND user_id=?",
-                         (bill_id, current_user.id)).fetchone()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM bills WHERE id=%s AND user_id=%s",
+                (bill_id, current_user.id)
+            )
+            b = cur.fetchone()
     if not b:
         flash("Bill not found.")
         return redirect("/")
     with get_db() as conn:
-        conn.execute("DELETE FROM payments WHERE id=? AND bill_id=?", (payment_id, bill_id))
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM payments WHERE id=%s AND bill_id=%s",
+                (payment_id, bill_id)
+            )
     flash("Payment removed.")
     return redirect(f"/bill/{bill_id}")
 
@@ -268,14 +285,19 @@ def delete_payment(bill_id, payment_id):
 @login_required
 def delete_bill(bill_id):
     with get_db() as conn:
-        b = conn.execute("SELECT id FROM bills WHERE id=? AND user_id=?",
-                         (bill_id, current_user.id)).fetchone()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM bills WHERE id=%s AND user_id=%s",
+                (bill_id, current_user.id)
+            )
+            b = cur.fetchone()
     if not b:
         flash("Bill not found.")
         return redirect("/")
     with get_db() as conn:
-        conn.execute("DELETE FROM payments WHERE bill_id=?", (bill_id,))
-        conn.execute("DELETE FROM bills WHERE id=?", (bill_id,))
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM payments WHERE bill_id=%s", (bill_id,))
+            cur.execute("DELETE FROM bills WHERE id=%s", (bill_id,))
     flash("Bill deleted.")
     return redirect("/")
 
@@ -285,17 +307,24 @@ def delete_bill(bill_id):
 @login_required
 def export_csv(bill_id):
     with get_db() as conn:
-        b = conn.execute("SELECT id, name, currency FROM bills WHERE id=? AND user_id=?",
-                         (bill_id, current_user.id)).fetchone()
-        if not b:
-            flash("Bill not found.")
-            return redirect("/")
-        rows = conn.execute("SELECT name, amount FROM payments WHERE bill_id=?", (bill_id,)).fetchall()
-    payments = [{"name": r[0], "amount": r[1]} for r in rows]
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, name, currency FROM bills WHERE id=%s AND user_id=%s",
+                (bill_id, current_user.id)
+            )
+            b = cur.fetchone()
+            if not b:
+                flash("Bill not found.")
+                return redirect("/")
+            cur.execute(
+                "SELECT name, amount FROM payments WHERE bill_id=%s", (bill_id,)
+            )
+            rows = cur.fetchall()
+    payments = [{"name": r["name"], "amount": r["amount"]} for r in rows]
     total, share, transactions = calculate(payments)
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["Name", f"Amount ({b[2]})"])
+    writer.writerow(["Name", f"Amount ({b['currency']})"])
     for p in payments:
         writer.writerow([p["name"], f"{p['amount']:.2f}"])
     writer.writerow([])
@@ -309,7 +338,7 @@ def export_csv(bill_id):
     return Response(
         output.getvalue(),
         mimetype="text/csv",
-        headers={"Content-Disposition": f"attachment;filename={b[1].replace(' ','_')}.csv"}
+        headers={"Content-Disposition": f"attachment;filename={b['name'].replace(' ','_')}.csv"}
     )
 
 # ── JSON API ───────────────────────────────────────────────────────────────────
@@ -318,15 +347,22 @@ def export_csv(bill_id):
 @login_required
 def api_bill(bill_id):
     with get_db() as conn:
-        b = conn.execute("SELECT id, name, currency FROM bills WHERE id=? AND user_id=?",
-                         (bill_id, current_user.id)).fetchone()
-        if not b:
-            return jsonify({"error": "Not found"}), 404
-        rows = conn.execute("SELECT id, name, amount FROM payments WHERE bill_id=?", (bill_id,)).fetchall()
-    payments = [{"id": r[0], "name": r[1], "amount": r[2]} for r in rows]
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, name, currency FROM bills WHERE id=%s AND user_id=%s",
+                (bill_id, current_user.id)
+            )
+            b = cur.fetchone()
+            if not b:
+                return jsonify({"error": "Not found"}), 404
+            cur.execute(
+                "SELECT id, name, amount FROM payments WHERE bill_id=%s", (bill_id,)
+            )
+            rows = cur.fetchall()
+    payments = [{"id": r["id"], "name": r["name"], "amount": r["amount"]} for r in rows]
     total, share, transactions = calculate(payments)
     return jsonify({
-        "bill":         {"id": b[0], "name": b[1], "currency": b[2]},
+        "bill":         {"id": b["id"], "name": b["name"], "currency": b["currency"]},
         "payments":     payments,
         "total":        total,
         "share":        share,
