@@ -25,8 +25,9 @@ login_manager.login_message = "Please log in to access your bills."
 
 def get_db():
     conn = psycopg2.connect(
-        os.environ.get("DATABASE_URL"),
-        cursor_factory=psycopg2.extras.RealDictCursor
+    os.environ.get("DATABASE_URL"),
+    sslmode="require",
+    cursor_factory=psycopg2.extras.RealDictCursor
     )
     return conn
 
