@@ -25,9 +25,9 @@ login_manager.login_message = "Please log in to access your bills."
 
 def get_db():
     conn = psycopg2.connect(
-    os.environ.get("DATABASE_URL"),
-    sslmode="require",
-    cursor_factory=psycopg2.extras.RealDictCursor
+        os.environ.get("DATABASE_URL"),
+        sslmode="require",
+        cursor_factory=psycopg2.extras.RealDictCursor
     )
     return conn
 
@@ -40,13 +40,14 @@ class User(UserMixin):
 
 @login_manager.user_loader
 def load_user(user_id):
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id, username FROM users WHERE id=%s", (user_id,))
-            row = cur.fetchone()
-    if row:
-        return User(row["id"], row["username"])
-    return None
+    return User(1, "dev")  # DEV: always return fake user
+
+# ── DEV: Auto-login bypass (remove when DB is ready) ──────────────────────────
+
+@app.before_request
+def auto_login():
+    if not current_user.is_authenticated:
+        login_user(User(1, "dev"))
 
 # ── Bill splitting logic ───────────────────────────────────────────────────────
 
