@@ -75,44 +75,11 @@ def calculate(payments):
 
 @app.route("/register", methods=["GET", "POST"])
 def register():
-    if request.method == "POST":
-        username = request.form["username"].strip()
-        password = request.form["password"]
-        if not username or not password:
-            flash("Username and password are required.")
-            return redirect("/register")
-        hashed = generate_password_hash(password)
-        try:
-            with get_db() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "INSERT INTO users (username, password) VALUES (%s, %s)",
-                        (username, hashed)
-                    )
-            flash("Account created! Please log in.")
-            return redirect("/login")
-        except psycopg2.errors.UniqueViolation:
-            flash("Username already taken.")
-            return redirect("/register")
-    return render_template("register.html")
+    return redirect("/")  # DEV: bypassed
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
-    if request.method == "POST":
-        username = request.form["username"].strip()
-        password = request.form["password"]
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT id, username, password FROM users WHERE username=%s",
-                    (username,)
-                )
-                row = cur.fetchone()
-        if row and check_password_hash(row["password"], password):
-            login_user(User(row["id"], row["username"]))
-            return redirect("/")
-        flash("Invalid username or password.")
-    return render_template("login.html")
+    return redirect("/")  # DEV: bypassed
 
 @app.route("/logout")
 @login_required
